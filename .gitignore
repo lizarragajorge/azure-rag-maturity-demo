@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.streamlit/secrets.toml
+.azure/
+
+# Bicep compile output — generated from main.bicep, not source of truth
+infra/*.json
