@@ -92,11 +92,6 @@ for the full threat-by-threat write-up. The short version:
 
 [MIT](LICENSE) — fork it, modify it, deploy it.
 
-## What to show in the meeting
-
-Follow [docs/demo-script.md](docs/demo-script.md). It walks through the two
-questions in 15–20 minutes with concrete queries against the sample corpus.
-
 ## Sample corpus
 
 [data/utility_corpus/](data/utility_corpus/) contains 16 short documents

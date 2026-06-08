@@ -7,3 +7,6 @@ __pycache__/
 
 # Bicep compile output — generated from main.bicep, not source of truth
 infra/*.json
+
+# Internal/private docs — not for the public repo
+docs/
