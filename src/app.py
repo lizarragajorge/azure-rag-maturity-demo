@@ -836,12 +836,19 @@ st.markdown(
     "through each technique. Each tab makes **one** concrete point."
 )
 
-tab_overview, tab_reliability, tab_semantic, tab_agentic = st.tabs(
+(
+    tab_overview,
+    tab_reliability,
+    tab_semantic,
+    tab_agentic,
+    tab_playbook,
+) = st.tabs(
     [
         "0.  Overview & maturity model",
         "1.  Why retrieval matters",
         "2.  Tuning what 'relevant' means",
         "3.  Agentic retrieval  (new in Build 2026)",
+        "4.  Quality playbook  (12 levers)",
     ]
 )
 
@@ -1375,3 +1382,582 @@ with tab_agentic:
             st.json(resp)
         with st.expander("Raw grounding payload fed to the chat model"):
             st.code(grounding, language="json")
+
+
+# ---------------------------------------------------------------------------
+# Tab 4 — Quality playbook: 11 levers to improve AI Search retrieval
+# ---------------------------------------------------------------------------
+
+
+RETRIEVAL_QUALITY_LEVERS = [
+    # ---------- Phase 1: Index-time ----------
+    {
+        "phase": "🏗️ Index-time — make the data findable before queries arrive",
+        "title": "1. Chunking strategy",
+        "symptom": "The top-ranked chunk doesn't contain the answer even though the full document does.",
+        "lever": (
+            "Chunks that are too big bury the relevant sentence in noise; "
+            "chunks that are too small lose the surrounding context that makes "
+            "them embeddable. Target **800–1500 chars with 10–20% overlap** "
+            "on natural boundaries (paragraphs, headings). For long structured "
+            "docs (policies, runbooks, contracts), use **semantic chunking** "
+            "that splits on the heading hierarchy instead of fixed windows."
+        ),
+        "in_repo": "✅ See `src/common.py::_split_into_chunks` — 1200 chars + 200 overlap, paragraph-aware.",
+        "code": {
+            "language": "python",
+            "file": "src/common.py",
+            "body": (
+                "def _split_into_chunks(text, target_chars=1200, overlap=200):\n"
+                "    paras = re.split(r'\\n\\s*\\n', text.strip())\n"
+                "    chunks, buf = [], ''\n"
+                "    for p in paras:\n"
+                "        if len(buf) + len(p) > target_chars and buf:\n"
+                "            chunks.append(buf)\n"
+                "            buf = buf[-overlap:] + '\\n\\n' + p  # carry overlap\n"
+                "        else:\n"
+                "            buf = (buf + '\\n\\n' + p) if buf else p\n"
+                "    if buf: chunks.append(buf)\n"
+                "    return chunks"
+            ),
+        },
+        "effort": "S",
+        "impact": "🔥 High — the single biggest knob. Re-chunking often beats switching embedding models.",
+    },
+    {
+        "phase": "🏗️ Index-time — make the data findable before queries arrive",
+        "title": "2. Field design + metadata enrichment",
+        "symptom": "BM25 ranks the wrong chunk because the right one doesn't repeat the literal keyword in its body.",
+        "lever": (
+            "Don't index a single `content` field — give the ranker more signal:\n\n"
+            "- **`title`** (searchable, boosted) — the document name or section heading.\n"
+            "- **`keywords`** (searchable, Collection(Edm.String)) — domain terms extracted by a skillset (e.g. *PSPS, CIP-008, AMI, mercaptan*).\n"
+            "- **`summary`** (searchable) — 1–2 sentence LLM-generated abstract.\n"
+            "- **`docType`, `regulator`, `revisionDate`** (filterable + facetable) — for filters and scoring profiles below.\n\n"
+            "Use the **AI enrichment pipeline** (skillsets) to populate `keywords` "
+            "and `summary` at index time with one LLM call per doc. Then point "
+            "your semantic config at title+keywords (see Tab 2)."
+        ),
+        "in_repo": "✅ Index has `title`, `parent_id`, `chunk`, `content_vector`. 🛠️ Adding `keywords` + `summary` via a skillset is the next obvious lever.",
+        "code": {
+            "language": "python",
+            "file": "src/build_index.py",
+            "body": (
+                "# Add to the SearchIndex field list:\n"
+                "SearchableField(name='title', analyzer_name='en.microsoft'),\n"
+                "SearchableField(\n"
+                "    name='keywords', collection=True,\n"
+                "    analyzer_name='keyword',  # exact-match for jargon\n"
+                "),\n"
+                "SearchableField(name='summary', analyzer_name='en.microsoft'),\n"
+                "SimpleField(name='docType',  filterable=True, facetable=True),\n"
+                "SimpleField(name='revisionDate', type=SearchFieldDataType.DateTimeOffset,\n"
+                "            filterable=True, sortable=True),\n"
+                "\n"
+                "# In the semantic config, prioritize title + keywords:\n"
+                "SemanticPrioritizedFields(\n"
+                "    title_field=SemanticField(field_name='title'),\n"
+                "    keywords_fields=[SemanticField(field_name='keywords')],\n"
+                "    content_fields=[SemanticField(field_name='chunk')],\n"
+                ")"
+            ),
+        },
+        "effort": "M",
+        "impact": "🔥 High — typically +10–20% NDCG, and unlocks every other lever (filters, scoring profiles, semantic ranker).",
+    },
+    {
+        "phase": "🏗️ Index-time — make the data findable before queries arrive",
+        "title": "3. Synonym maps",
+        "symptom": "Users type *'rolling blackout'* but the docs say *'load shedding'* — BM25 misses it; vector sort-of catches it.",
+        "lever": (
+            "A **SynonymMap** rewrites query terms before BM25 sees them. Perfect "
+            "for industry jargon and abbreviation expansion. One-time setup, "
+            "near-zero query cost, and it stacks on top of vector + semantic."
+        ),
+        "in_repo": "🛠️ Not yet in this repo. Add 4–6 maps for the utility domain (PSPS↔public safety power shutoff, AMI↔smart meter, CIP↔NERC CIP, etc.).",
+        "code": {
+            "language": "python",
+            "file": "src/build_index.py (new)",
+            "body": (
+                "from azure.search.documents.indexes.models import SynonymMap\n"
+                "\n"
+                "smap = SynonymMap(\n"
+                "    name='utility-jargon',\n"
+                "    # equivalent terms; one rule per line\n"
+                "    synonyms='\\n'.join([\n"
+                "        'psps, public safety power shutoff, de-energization',\n"
+                "        'load shedding, rolling blackout, controlled outage',\n"
+                "        'ami, smart meter, advanced metering infrastructure',\n"
+                "        'mercaptan, odorant, thiol',\n"
+                "        'cip-008, nerc cip-008, cyber incident response',\n"
+                "    ]),\n"
+                ")\n"
+                "index_client.create_or_update_synonym_map(smap)\n"
+                "\n"
+                "# Then attach to the searchable fields you care about:\n"
+                "SearchableField(name='chunk', synonym_map_names=['utility-jargon'])"
+            ),
+        },
+        "effort": "S",
+        "impact": "Medium — surgical win for vocabulary mismatch, especially in regulated industries.",
+    },
+    # ---------- Phase 2: Query-time ----------
+    {
+        "phase": "🔍 Query-time — shape each call so the index returns the right slice",
+        "title": "4. Filters (narrow the corpus before scoring)",
+        "symptom": "The reranker has to fight through 50 chunks from the wrong document type before finding the right one.",
+        "lever": (
+            "Filters are free and aggressive — use them. If the user (or the "
+            "agent) gives you a regulator, doc type, region, or date range, "
+            "filter on it. Filters happen **before** scoring, so they shrink "
+            "the candidate pool the ranker has to consider, which improves "
+            "both quality and latency."
+        ),
+        "in_repo": "🛠️ Not used in this repo yet — corpus is tiny. Real deployments at 100k+ docs essentially require filters to stay performant.",
+        "code": {
+            "language": "python",
+            "file": "src/retrieval_lab.py",
+            "body": (
+                "# In your search call:\n"
+                "results = client.search(\n"
+                "    search_text=query,\n"
+                "    filter=(\n"
+                "        \"docType eq 'runbook' \"\n"
+                "        \"and regulator eq 'NERC' \"\n"
+                "        \"and revisionDate ge 2025-01-01T00:00:00Z\"\n"
+                "    ),\n"
+                "    select=['parent_id','title','chunk'],\n"
+                "    top=5,\n"
+                ")"
+            ),
+        },
+        "effort": "S",
+        "impact": "🔥 High at scale — filters routinely cut latency 5–10x and bump precision because the ranker isn't distracted.",
+    },
+    {
+        "phase": "🔍 Query-time — shape each call so the index returns the right slice",
+        "title": "5. Scoring profiles (boost by recency, source authority, doc type)",
+        "symptom": "Two chunks tie on text relevance but one is from a 2026 revision and one is from a 2019 obsolete spec — the obsolete one wins half the time.",
+        "lever": (
+            "A **scoring profile** is a function that multiplies the base "
+            "search score by configurable signals. Common boosts: **recency** "
+            "(newer revisions rank higher), **source authority** (regulator-issued > "
+            "internal-wiki), **doc-type weight** (runbooks > marketing). "
+            "Attached to the index, applied per-query."
+        ),
+        "in_repo": "🛠️ Not in this repo. Highest-value addition for any docs-with-revisions corpus.",
+        "code": {
+            "language": "python",
+            "file": "src/build_index.py (new)",
+            "body": (
+                "from azure.search.documents.indexes.models import (\n"
+                "    ScoringProfile, FreshnessScoringFunction,\n"
+                "    FreshnessScoringParameters, TextWeights,\n"
+                ")\n"
+                "\n"
+                "profile = ScoringProfile(\n"
+                "    name='prefer-recent-authoritative',\n"
+                "    text_weights=TextWeights(weights={\n"
+                "        'title':    5.0,   # title hits worth 5x\n"
+                "        'keywords': 3.0,\n"
+                "        'chunk':    1.0,\n"
+                "    }),\n"
+                "    functions=[\n"
+                "        FreshnessScoringFunction(\n"
+                "            field_name='revisionDate', boost=2.0,\n"
+                "            parameters=FreshnessScoringParameters(\n"
+                "                boosting_duration='P730D',  # 2-year half-life\n"
+                "            ),\n"
+                "            interpolation='quadratic',\n"
+                "        ),\n"
+                "    ],\n"
+                ")\n"
+                "index.scoring_profiles.append(profile)\n"
+                "index.default_scoring_profile = 'prefer-recent-authoritative'"
+            ),
+        },
+        "effort": "M",
+        "impact": "🔥 High — directly fixes the *'stale doc kept winning'* failure mode.",
+    },
+    {
+        "phase": "🔍 Query-time — shape each call so the index returns the right slice",
+        "title": "6. Hybrid weight + RRF tuning",
+        "symptom": "Hybrid is *worse* than vector-only on some queries because BM25 is dragging in noise.",
+        "lever": (
+            "Hybrid search merges BM25 + vector results using **Reciprocal "
+            "Rank Fusion (RRF)**. The defaults are reasonable but tunable. "
+            "Two knobs:\n\n"
+            "- **Vector weight** (`VectorizableTextQuery(weight=...)`) — bump above "
+            "1.0 when your queries are paraphrastic; lower below 1.0 when "
+            "users type exact identifiers (model numbers, regulation cites).\n"
+            "- **`top` per modality** — increase the candidate pool before "
+            "RRF picks final winners (e.g. `k_nearest_neighbors=50` even "
+            "though you only return top=5)."
+        ),
+        "in_repo": "✅ Tab 1 → Hybrid uses the default weight. Try bumping vector to 2.0 for paraphrase-heavy queries.",
+        "code": {
+            "language": "python",
+            "file": "src/retrieval_lab.py",
+            "body": (
+                "from azure.search.documents.models import VectorizableTextQuery\n"
+                "\n"
+                "results = client.search(\n"
+                "    search_text=query,           # BM25 side\n"
+                "    vector_queries=[VectorizableTextQuery(\n"
+                "        text=query,\n"
+                "        fields='content_vector',\n"
+                "        k_nearest_neighbors=50,  # ← wide candidate pool\n"
+                "        weight=2.0,              # ← bias toward vector\n"
+                "    )],\n"
+                "    query_type='semantic',\n"
+                "    semantic_configuration_name='default',\n"
+                "    top=5,\n"
+                ")"
+            ),
+        },
+        "effort": "S",
+        "impact": "Medium — small but reliable; A/B test before committing.",
+    },
+    # ---------- Phase 3: Rerank & gate ----------
+    {
+        "phase": "🎯 Rerank & gate — make the system honest about what it doesn't know",
+        "title": "7. Semantic reranker config (title vs keywords vs content)",
+        "symptom": "Two configs (same data, different recipes) return different top-1 docs — Tab 2 makes this concrete.",
+        "lever": (
+            "The semantic ranker re-scores the top ~50 BM25/vector candidates "
+            "using a deep learning model. You control which fields it pays "
+            "attention to via the **semantic configuration**. Three named "
+            "configs you should always have:\n\n"
+            "- **title-and-keywords** — title is the strongest signal; perfect for FAQ-style queries.\n"
+            "- **content-only** — best when titles are generic or boilerplate.\n"
+            "- **default-balanced** — title + keywords + content; safest default.\n\n"
+            "Pick at query time based on query shape (or A/B test)."
+        ),
+        "in_repo": "✅ Tab 2 demos all three side-by-side. See `src/retrieval_lab.py::run_semantic` and the three configs in `src/build_index.py`.",
+        "code": {
+            "language": "python",
+            "file": "src/build_index.py",
+            "body": (
+                "SemanticConfiguration(\n"
+                "    name='title-and-keywords',\n"
+                "    prioritized_fields=SemanticPrioritizedFields(\n"
+                "        title_field=SemanticField(field_name='title'),\n"
+                "        keywords_fields=[SemanticField(field_name='keywords')],\n"
+                "        # NO content_fields — force the model to trust\n"
+                "        # title + keywords for matching\n"
+                "    ),\n"
+                ")"
+            ),
+        },
+        "effort": "S",
+        "impact": "Medium — biggest gain when your titles are clean and meaningful.",
+    },
+    {
+        "phase": "🎯 Rerank & gate — make the system honest about what it doesn't know",
+        "title": "8. Anatomy of a good semantic configuration (cross-encoder design)",
+        "symptom": "You enabled semantic ranking and… it barely moved the needle. Or it moved it the wrong way on long documents.",
+        "lever": (
+            "A **semantic configuration** is the contract you sign with the "
+            "cross-encoder ranker: *'here are the fields you should read, in "
+            "this order of importance, when you decide who wins.'* Getting "
+            "this contract right is what separates *'we turned on semantic'* "
+            "from *'semantic actually helps.'*\n\n"
+            "**What the ranker actually sees (and its limits):**\n\n"
+            "- A deep-learning **cross-encoder** model re-scores the top "
+            "~50 candidates from BM25/vector. It reads each candidate "
+            "*together with* the query — that's why it catches paraphrase "
+            "and intent in a way BM25 alone can't.\n"
+            "- It has a **~2,000 token budget per document**. Long docs get "
+            "truncated *in the order you specified*. Title first, then "
+            "keywords, then content. If your chunks are huge, the bottom "
+            "half is invisible to the ranker — yet another reason to chunk "
+            "well (lever #1).\n"
+            "- It outputs a calibrated **`rerankerScore` (0–4)** — the only "
+            "score in the system you can confidently threshold on "
+            "(lever #9 below). BM25 and vector scores are not comparable "
+            "across queries.\n\n"
+            "**Design rules for the prioritized-fields contract:**\n\n"
+            "1. **`title_field`** → the cleanest one-line summary of the doc "
+            "(or section). If your titles are autogenerated junk like "
+            "`Page1.pdf`, fix that *first* — it's the strongest signal.\n"
+            "2. **`keywords_fields`** → dense, domain-specific terms. Best "
+            "populated by a skillset that extracts entities + acronyms "
+            "(e.g. *PSPS, CIP-008-6, IEEE 1547*). Three to ten per chunk.\n"
+            "3. **`content_fields`** → the chunk body. Order matters if you "
+            "list multiple — the ranker reads top-to-bottom until its 2k "
+            "budget is exhausted.\n\n"
+            "**Free bonuses you get when you enable semantic:**\n\n"
+            "- **`@search.captions`** — extractive snippets with the matching "
+            "passages **highlighted**. Show these in your UI; they're better "
+            "than truncating the chunk yourself.\n"
+            "- **`@search.answers`** — if the query is a direct question and "
+            "the answer is a short span in a doc, the ranker extracts it "
+            "for you. Set `query_answer='extractive|count-3'` on the search "
+            "call. Great for FAQ surfaces; useless for synthesis-style queries.\n\n"
+            "**When NOT to enable semantic ranking:** exact-identifier "
+            "lookups (model numbers, regulation cites, customer IDs) where "
+            "BM25 + filter is already 100% precise — you're just paying the "
+            "~300ms latency + extra unit cost for nothing."
+        ),
+        "in_repo": "✅ `src/build_index.py` defines three configs (`default-balanced`, `content-only`, `title-and-keywords`) and Tab 2 demos how the same query ranks differently across them. 🛠️ Next step: enable captions/answers in the query call so the UI can show extractive highlights instead of full chunks.",
+        "code": {
+            "language": "python",
+            "file": "src/build_index.py + src/retrieval_lab.py",
+            "body": (
+                "# 1) Define the configuration on the index (one-time)\n"
+                "from azure.search.documents.indexes.models import (\n"
+                "    SemanticConfiguration, SemanticPrioritizedFields,\n"
+                "    SemanticField, SemanticSearch,\n"
+                ")\n"
+                "\n"
+                "config = SemanticConfiguration(\n"
+                "    name='default-balanced',\n"
+                "    prioritized_fields=SemanticPrioritizedFields(\n"
+                "        title_field=SemanticField(field_name='title'),\n"
+                "        keywords_fields=[SemanticField(field_name='keywords')],\n"
+                "        content_fields=[SemanticField(field_name='chunk')],\n"
+                "        # order matters: ranker reads top-to-bottom until\n"
+                "        # ~2k token budget per doc is exhausted\n"
+                "    ),\n"
+                ")\n"
+                "index.semantic_search = SemanticSearch(configurations=[config])\n"
+                "\n"
+                "# 2) Use it at query time — and ask for captions + answers\n"
+                "results = client.search(\n"
+                "    search_text=query,\n"
+                "    query_type='semantic',\n"
+                "    semantic_configuration_name='default-balanced',\n"
+                "    query_caption='extractive|highlight-true',  # ← free\n"
+                "    query_answer='extractive|count-3',           # ← free\n"
+                "    top=5,\n"
+                ")\n"
+                "\n"
+                "for r in results:\n"
+                "    print(r['@search.rerankerScore'])     # 0–4, gateable\n"
+                "    for cap in r['@search.captions']:\n"
+                "        print(cap.text, cap.highlights)   # show in UI\n"
+                "for ans in results.get_answers() or []:\n"
+                "    print(ans.text, ans.score)            # direct-answer UI"
+            ),
+        },
+        "effort": "S",
+        "impact": "🔥 High — typically +5–15% NDCG once title and keywords are populated. Captions/answers are free UX wins on top.",
+    },
+    {
+        "phase": "🎯 Rerank & gate — make the system honest about what it doesn't know",
+        "title": "9. Score gating (refuse-to-answer threshold)",
+        "symptom": "The chat model hallucinates an answer when retrieval returned no truly relevant chunks.",
+        "lever": (
+            "**The single most important lever for production RAG.** The "
+            "semantic reranker score is calibrated (0–4); BM25 / vector scores "
+            "are not. Pick a threshold (we use **≥2.0** for the green band; "
+            "1.5–2.0 = yellow; <1.5 = refuse) and **gate synthesis** on it. "
+            "Below the threshold, the chat model is told *'no good evidence — "
+            "say you don't know'* rather than handed weak chunks."
+        ),
+        "in_repo": "✅ Tab 1's *'Top-1 scores — only one is gateable'* table demonstrates this. The reranker scale is the only one you can threshold on.",
+        "code": {
+            "language": "python",
+            "file": "src/agentic_demo.py",
+            "body": (
+                "REFUSE_THRESHOLD = 1.5  # reranker score below this → refuse\n"
+                "\n"
+                "top1 = max(r.get('rerankerScore', 0) for r in references) \\\n"
+                "       if references else 0\n"
+                "\n"
+                "if top1 < REFUSE_THRESHOLD:\n"
+                "    return (\n"
+                "        \"I don't have enough evidence in the knowledge base \"\n"
+                "        \"to answer that confidently. Try rephrasing, or \"\n"
+                "        \"escalate to a subject-matter expert.\"\n"
+                "    )\n"
+                "\n"
+                "# Otherwise, hand the (good) chunks to the chat model:\n"
+                "answer = synthesize_answer(settings, question, grounding)"
+            ),
+        },
+        "effort": "S",
+        "impact": "🔥🔥 Highest possible — turns a 'sometimes hallucinates' demo into a production-safe system.",
+    },
+    # ---------- Phase 4: Architecture & ops ----------
+    {
+        "phase": "🏛️ Architecture & ops — once the basics are solid, scale and observe",
+        "title": "10. Agentic decomposition (already shown in Tab 3)",
+        "symptom": "User asks a multi-part question; one retrieval call covers half of it.",
+        "lever": (
+            "Use a **Knowledge Base** (preview API `2026-05-01-preview` with "
+            "`messages` body) to let the chat model decompose the question into "
+            "sub-queries, run them in parallel, and rerank the union. You get "
+            "an `activity` trace showing exactly which sub-queries fired — "
+            "perfect for observability and debugging."
+        ),
+        "in_repo": "✅ Tab 3 demos this end-to-end. See `src/agentic_demo.py::retrieve`.",
+        "code": {
+            "language": "python",
+            "file": "src/agentic_demo.py",
+            "body": (
+                "RETRIEVE_API_VERSION = '2026-05-01-preview'\n"
+                "\n"
+                "body = {\n"
+                "    'messages': [{'role': 'user',\n"
+                "                  'content': [{'type': 'text', 'text': question}]}],\n"
+                "    'includeActivity': True,         # ← get the planner trace\n"
+                "    'outputMode': 'extractiveData',  # we synthesize ourselves\n"
+                "    'retrievalReasoningEffort': {'kind': 'low'},\n"
+                "    'knowledgeSourceParams': [{\n"
+                "        'knowledgeSourceName': ks_name,\n"
+                "        'kind': 'searchIndex',\n"
+                "        'includeReferences': True,\n"
+                "    }],\n"
+                "}\n"
+                "# activity → [modelQueryPlanning, searchIndex × N, agenticReasoning]"
+            ),
+        },
+        "effort": "M",
+        "impact": "🔥 High for multi-part queries; near-zero for single-intent queries (don't pay the planner tax unnecessarily).",
+    },
+    {
+        "phase": "🏛️ Architecture & ops — once the basics are solid, scale and observe",
+        "title": "11. Multi-index strategy (one index per domain)",
+        "symptom": "Single mega-index returns a public-relations doc when the question was about a NERC compliance procedure.",
+        "lever": (
+            "When your corpus spans clearly distinct domains (operations, "
+            "compliance, customer-facing, HR), split into multiple indexes "
+            "and route the query to the right one(s). Routing can be:\n\n"
+            "- **Filter-based** (one index, but a `domain` filter — easiest).\n"
+            "- **Multi-index** (separate indexes, classifier picks one).\n"
+            "- **Knowledge agent with multiple sources** (the planner picks per sub-query — best for cross-domain questions like Tab 3's queries).\n\n"
+            "Multi-index also lets each domain have its own chunking, fields, "
+            "scoring profile, and refresh cadence."
+        ),
+        "in_repo": "🛠️ Single index today. Worth splitting once corpus passes a few thousand docs across 3+ domains.",
+        "code": {
+            "language": "python",
+            "file": "(architectural pattern)",
+            "body": (
+                "# Option A: route by classifier (cheapest)\n"
+                "domain = classify(question)   # tiny LLM call or rules\n"
+                "client = clients_by_domain[domain]\n"
+                "results = client.search(...)\n"
+                "\n"
+                "# Option B: knowledge base with multiple knowledge sources\n"
+                "kb.knowledge_sources = [\n"
+                "    {'name': 'ks-operations', 'kind': 'searchIndex', ...},\n"
+                "    {'name': 'ks-compliance', 'kind': 'searchIndex', ...},\n"
+                "    {'name': 'ks-customer',   'kind': 'searchIndex', ...},\n"
+                "]\n"
+                "# planner decides which to query per sub-question"
+            ),
+        },
+        "effort": "L",
+        "impact": "🔥 High at scale; overkill below ~5k docs.",
+    },
+    {
+        "phase": "🏛️ Architecture & ops — once the basics are solid, scale and observe",
+        "title": "12. Evaluation harness (golden Q&A + NDCG/MRR + LLM-as-judge)",
+        "symptom": "You shipped lever #7, but nobody can tell whether retrieval actually got better.",
+        "lever": (
+            "**You cannot improve what you don't measure.** Build a small "
+            "golden set (50–200 Q&A pairs with expected `parent_id`s) and "
+            "run it as a smoke test on every index change. Track:\n\n"
+            "- **Recall@k** — does the right chunk appear in the top-k?\n"
+            "- **NDCG / MRR** — is it ranked high?\n"
+            "- **LLM-as-judge** — does the synthesized answer cite correctly and avoid hallucinations?\n\n"
+            "For utilities specifically, add **adversarial cases**: queries "
+            "that should be refused (out-of-scope), queries with regulatory "
+            "ambiguity, queries where the answer is *'it depends — escalate'*."
+        ),
+        "in_repo": "🛠️ Not in this repo. Easy weekend project; gates every future change.",
+        "code": {
+            "language": "python",
+            "file": "tests/eval_retrieval.py (new)",
+            "body": (
+                "GOLDEN = [\n"
+                "    {'q': 'What's a Grade 1 gas leak response time?',\n"
+                "     'expected_parents': ['doc-001'], 'must_refuse': False},\n"
+                "    {'q': 'When can we de-energize for wildfire risk?',\n"
+                "     'expected_parents': ['doc-003'], 'must_refuse': False},\n"
+                "    {'q': 'What's our HR vacation policy?',  # adversarial\n"
+                "     'expected_parents': [], 'must_refuse': True},\n"
+                "    # ... 50–200 of these, curated with SMEs\n"
+                "]\n"
+                "\n"
+                "def evaluate():\n"
+                "    hits, mrr, refuse_correct = 0, 0.0, 0\n"
+                "    for case in GOLDEN:\n"
+                "        results = run_hybrid_semantic(case['q'], top=5)\n"
+                "        parents = [r['parent_id'] for r in results]\n"
+                "        if case['must_refuse']:\n"
+                "            top_score = results[0]['rerankerScore'] if results else 0\n"
+                "            refuse_correct += int(top_score < 1.5)\n"
+                "            continue\n"
+                "        for rank, p in enumerate(parents, 1):\n"
+                "            if p in case['expected_parents']:\n"
+                "                hits += 1\n"
+                "                mrr += 1 / rank\n"
+                "                break\n"
+                "    print(f'recall@5={hits/len(GOLDEN):.2%}  MRR={mrr/len(GOLDEN):.3f}')"
+            ),
+        },
+        "effort": "M",
+        "impact": "🔥🔥 Highest leverage long-term — every other lever becomes objectively measurable.",
+    },
+]
+
+
+EFFORT_LABEL = {
+    "S": ("Small", "🟢"),  # < 1 day
+    "M": ("Medium", "🟡"),  # 1–3 days
+    "L": ("Large", "🟠"),  # > 1 week
+}
+
+
+def _render_lever(lever: dict) -> None:
+    title = f"**{lever['title']}**  ·  effort: {EFFORT_LABEL[lever['effort']][1]} {EFFORT_LABEL[lever['effort']][0]}"
+    with st.expander(title, expanded=False):
+        st.markdown(f"**🩺 Symptom** — {lever['symptom']}")
+        st.markdown(f"**🔧 The lever** — {lever['lever']}")
+        st.markdown(f"**📂 In this repo** — {lever['in_repo']}")
+        st.caption(f"`{lever['code']['file']}`")
+        st.code(lever["code"]["body"], language=lever["code"]["language"])
+        st.markdown(f"**📈 Impact** — {lever['impact']}")
+
+
+with tab_playbook:
+    st.subheader("12 levers to push AI Search retrieval quality higher")
+    st.markdown(
+        "You've now seen four retrieval methods (Tab 1), three semantic "
+        "configs (Tab 2), and agentic decomposition (Tab 3). So **what do you "
+        "actually do** to make your own AI Search deployment better?"
+    )
+    st.markdown(
+        "This playbook organizes the levers by **pipeline phase** — fix things "
+        "early (at index time) before fixing them late (at query time), and "
+        "fix things late before adding architectural complexity. Each lever "
+        "lists the **symptom** it addresses, the **fix**, what it would look "
+        "like **in this codebase**, and an **effort/impact** estimate."
+    )
+    st.info(
+        "💡 **Reading order suggestion:** start with Phase 3 lever #8 (score "
+        "gating). It's the single biggest win and lowest effort for any "
+        "production RAG system."
+    )
+
+    phases_seen = set()
+    for lever in RETRIEVAL_QUALITY_LEVERS:
+        if lever["phase"] not in phases_seen:
+            st.markdown(f"### {lever['phase']}")
+            phases_seen.add(lever["phase"])
+        _render_lever(lever)
+
+    st.divider()
+    st.markdown(
+        "### 🗺️ Where to go after this"
+    )
+    st.markdown(
+        "- **[Azure AI Search docs — relevance tuning overview](https://learn.microsoft.com/azure/search/search-relevance-overview)**\n"
+        "- **[Scoring profiles reference](https://learn.microsoft.com/azure/search/index-add-scoring-profiles)**\n"
+        "- **[Semantic ranking deep-dive](https://learn.microsoft.com/azure/search/semantic-search-overview)**\n"
+        "- **[Knowledge bases (Build 2026 preview)](https://learn.microsoft.com/azure/search/search-knowledge-overview)**\n"
+        "- **[RAG eval with Azure AI Foundry](https://learn.microsoft.com/azure/ai-foundry/concepts/evaluation-approach-gen-ai)**\n"
+    )
