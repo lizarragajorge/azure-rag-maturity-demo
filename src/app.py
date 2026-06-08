@@ -76,6 +76,31 @@ flowchart LR
     class AOAI ai
     class APP app
 """,
+        "code": {
+            "caption": "There's no retrieval. The whole 'integration' is one chat call. Adapted from `src/agentic_demo.py` — same SDK pattern, no grounding payload.",
+            "file": "src/agentic_demo.py",
+            "language": "python",
+            "body": (
+                'from openai import AzureOpenAI\n'
+                '\n'
+                'aoai = AzureOpenAI(\n'
+                '    azure_endpoint=settings.aoai_endpoint,\n'
+                '    azure_ad_token_provider=get_aoai_token_provider(),\n'
+                '    api_version="2024-10-21",\n'
+                ')\n'
+                '\n'
+                'resp = aoai.chat.completions.create(\n'
+                '    model=settings.aoai_chat_deployment,  # gpt-5-mini\n'
+                '    messages=[\n'
+                '        {"role": "system", "content": "You answer questions."},\n'
+                '        {"role": "user",   "content": question},\n'
+                '    ],\n'
+                ')\n'
+                'print(resp.choices[0].message.content)\n'
+                '# ⚠️  The model has no idea what *your* docs say. It will\n'
+                '#    confidently make up gas-leak procedures and FERC numbers.'
+            ),
+        },
     },
     {
         "id": "L1",
@@ -122,6 +147,34 @@ flowchart LR
     class APP app
     class DOCS data
 """,
+        "code": {
+            "caption": (
+                "Verbatim from `src/retrieval_lab.py::run_keyword`. "
+                "`client.search(search_text=...)` with no vector_queries and "
+                "no query_type defaults to **BM25 keyword search** — this is "
+                "what Azure AI Search does out of the box."
+            ),
+            "file": "src/retrieval_lab.py",
+            "language": "python",
+            "body": (
+                'def run_keyword(settings, query, top=5):\n'
+                '    """Plain BM25 keyword search. Strong on exact terms,\n'
+                '    weak on paraphrase.\"\"\"\n'
+                '    client = SearchClient(\n'
+                '        endpoint=settings.search_endpoint,\n'
+                '        index_name=settings.search_index_name,\n'
+                '        credential=get_credential(),\n'
+                '    )\n'
+                '    results = client.search(\n'
+                '        search_text=query,   # ← BM25; no vector, no semantic\n'
+                '        top=top,\n'
+                '        select=["id", "title", "content", "source"],\n'
+                '    )\n'
+                '    return list(results)\n'
+                '# Then you stuff results into the prompt and hope the LLM\n'
+                '# picks the right chunk. Breaks on paraphrase.'
+            ),
+        },
     },
     {
         "id": "L2",
@@ -169,6 +222,36 @@ flowchart LR
     class APP app
     class DOCS data
 """,
+        "code": {
+            "caption": (
+                "Verbatim from `src/retrieval_lab.py::run_vector`. "
+                "`VectorizableTextQuery` is the *integrated vectorizer* path: "
+                "the index embeds the query for you using the "
+                "`AzureOpenAIVectorizer` you declared on the field — no "
+                "client-side embedding call required."
+            ),
+            "file": "src/retrieval_lab.py",
+            "language": "python",
+            "body": (
+                'from azure.search.documents.models import VectorizableTextQuery\n'
+                '\n'
+                'def run_vector(settings, query, top=5):\n'
+                '    client = SearchClient(...)\n'
+                '    vector_query = VectorizableTextQuery(\n'
+                '        text=query,             # AI Search embeds it for you\n'
+                '        k_nearest_neighbors=top,\n'
+                '        fields="content_vector",\n'
+                '    )\n'
+                '    results = client.search(\n'
+                '        search_text=None,       # ← vector only, no BM25\n'
+                '        vector_queries=[vector_query],\n'
+                '        top=top,\n'
+                '    )\n'
+                '    return list(results)\n'
+                '# Handles paraphrase. Can drift on rare proper nouns or\n'
+                '# numeric thresholds ("25 cal/cm²") with no semantic neighborhood.'
+            ),
+        },
     },
     {
         "id": "L3",
@@ -201,9 +284,11 @@ flowchart LR
         ],
         "diagram": """
 flowchart LR
-    DOCS[(Documents)] -. chunked + embedded .-> SEARCH
+    DOCS[(Documents)] -. chunked .-> EMB
+    EMB[Azure OpenAI<br/>text-embedding-3-large] -. vectors .-> SEARCH
     U([User]) -- question --> APP[Your app]
-    APP -- hybrid query --> SEARCH[Azure AI Search<br/>HYBRID:<br/>BM25 + vector + L2 reranker]
+    APP -- hybrid query<br/>text + VectorizableTextQuery --> SEARCH[Azure AI Search<br/>HYBRID:<br/>BM25 + vector + L2 reranker]
+    SEARCH -- integrated vectorizer<br/>embeds query --> EMB
     SEARCH -- top-k + rerankerScore --> APP
     APP -- gate: score ≥ 2.0? --> AOAI[Azure OpenAI<br/>gpt-5-mini]
     AOAI -- cited answer --> APP --> U
@@ -211,11 +296,49 @@ flowchart LR
     classDef search fill:#bbf7d0,stroke:#16a34a,stroke-width:3px,color:#000
     classDef app fill:#f3f4f6,stroke:#6b7280,color:#000
     classDef data fill:#fce7f3,stroke:#be185d,color:#000
-    class AOAI ai
+    class AOAI,EMB ai
     class SEARCH search
     class APP app
     class DOCS data
 """,
+        "code": {
+            "caption": (
+                "Verbatim from `src/retrieval_lab.py::run_semantic` — this is "
+                "what Tabs 1 & 2 of this app actually call. Send **both** "
+                "`search_text` and `vector_queries` (= hybrid + RRF), add "
+                "`query_type=SEMANTIC` + a `semantic_configuration_name` (= L2 "
+                "reranker). The `rerankerScore` on each hit is your gate."
+            ),
+            "file": "src/retrieval_lab.py",
+            "language": "python",
+            "body": (
+                'from azure.search.documents.models import (\n'
+                '    QueryType, QueryCaptionType, QueryAnswerType,\n'
+                '    VectorizableTextQuery,\n'
+                ')\n'
+                '\n'
+                'def run_semantic(settings, query, top=5,\n'
+                '                 semantic_configuration="default-balanced"):\n'
+                '    client = SearchClient(...)\n'
+                '    vector_query = VectorizableTextQuery(\n'
+                '        text=query, k_nearest_neighbors=50,\n'
+                '        fields="content_vector",\n'
+                '    )\n'
+                '    results = client.search(\n'
+                '        search_text=query,             # BM25\n'
+                '        vector_queries=[vector_query], # + vector → hybrid via RRF\n'
+                '        top=top,\n'
+                '        query_type=QueryType.SEMANTIC,         # ← L2 reranker on\n'
+                '        semantic_configuration_name=semantic_configuration,\n'
+                '        query_caption=QueryCaptionType.EXTRACTIVE,\n'
+                '        query_answer=QueryAnswerType.EXTRACTIVE,\n'
+                '    )\n'
+                '    return list(results)\n'
+                '\n'
+                '# Each hit now has @search.rerankerScore (0–4).\n'
+                '# Three-band gate:  ≥ 2.0 ground   •   1.5–2.0 caveat   •   < 1.5 refuse.'
+            ),
+        },
     },
     {
         "id": "L4",
@@ -270,6 +393,41 @@ flowchart LR
     class APP app
     class DOCS data
 """,
+        "code": {
+            "caption": (
+                "Verbatim from `src/agentic_demo.py::retrieve` — this is what "
+                "Tab 3 calls. **One REST call** to `POST /knowledgebases/{name}/retrieve` "
+                "on api-version `2026-04-01` (GA). The KB does the query "
+                "decomposition, runs the subqueries in parallel against the "
+                "knowledge source, and returns grounding + activity trace."
+            ),
+            "file": "src/agentic_demo.py",
+            "language": "python",
+            "body": (
+                'API_VERSION = "2026-04-01"  # GA — Build 2026 release\n'
+                '\n'
+                'def retrieve(settings, question):\n'
+                '    url = (\n'
+                '        f"{settings.search_endpoint}"\n'
+                '        f"/knowledgebases/{settings.knowledge_base_name}"\n'
+                '        f"/retrieve?api-version={API_VERSION}"\n'
+                '    )\n'
+                '    body = {\n'
+                '        "intents": [{"search": question, "type": "semantic"}],\n'
+                '        "includeActivity": True,\n'
+                '        "knowledgeSourceParams": [{\n'
+                '            "knowledgeSourceName": settings.knowledge_source_name,\n'
+                '            "kind": "searchIndex",\n'
+                '            "includeReferences": True,\n'
+                '            "includeReferenceSourceData": True,\n'
+                '        }],\n'
+                '    }\n'
+                '    r = requests.post(url, headers=_headers(...),\n'
+                '                      data=json.dumps(body), timeout=120)\n'
+                '    r.raise_for_status()\n'
+                '    return r.json()   # → {"response":..., "activity":..., "references":[...]}'
+            ),
+        },
     },
 ]
 
@@ -315,6 +473,18 @@ def _render_level(level: dict, *, height: int = 360) -> None:
         st.markdown("**What it still can't do**")
         st.markdown("\n".join(f"- {s}" for s in level["cons"]))
 
+    code = level.get("code")
+    if code:
+        with st.expander(
+            f"👩‍💻  Show the code for {level['id']} (from this repo)",
+            expanded=False,
+        ):
+            st.markdown(
+                f"{code['caption']}  \n"
+                f"_See [{code['file']}](https://github.com/lizarragajorge/azure-rag-maturity-demo/blob/main/{code['file']}) in the repo._"
+            )
+            st.code(code["body"], language=code.get("language", "python"))
+
     with st.expander(f"📚  Microsoft Learn docs for {level['id']}", expanded=False):
         st.markdown(
             "\n".join(f"- [{title}]({url})" for title, url in level["docs"])
@@ -330,7 +500,23 @@ def _render_level(level: dict, *, height: int = 360) -> None:
 st.set_page_config(
     page_title="RAG after Build 2026 — utility demo",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
+)
+
+# Hide Streamlit's built-in chrome (Deploy button → Streamlit Community Cloud /
+# Snowflake; main menu → Streamlit branding & share dialogs; footer).
+st.markdown(
+    """
+    <style>
+      [data-testid="stToolbar"] {visibility: hidden; height: 0; position: fixed;}
+      [data-testid="stDecoration"] {display: none;}
+      [data-testid="stStatusWidget"] {visibility: hidden; height: 0; position: fixed;}
+      #MainMenu {visibility: hidden;}
+      header {visibility: hidden;}
+      footer {visibility: hidden;}
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 
@@ -455,30 +641,19 @@ def _result_card(result: RunResult, *, color: str, show_snippet: bool = True) ->
 # ---------------------------------------------------------------------------
 
 
-with st.sidebar:
-    st.markdown("### Demo configuration")
-    settings = get_settings()
-    st.write(f"**Index:** `{settings.search_index_name}`")
-    st.write(f"**Embedding:** `{settings.aoai_embedding_deployment}`")
-    st.write(f"**Chat model:** `{settings.aoai_chat_deployment}`")
-    st.markdown("---")
-    st.markdown("### Post-Build 2026 highlights")
-    st.markdown(
-        "- Agentic retrieval (GA in REST `2026-04-01`)\n"
-        "- Knowledge Bases + Knowledge Sources\n"
-        "- Query decomposition, parallel subqueries\n"
-        "- Answer synthesis with citations\n"
-        "- Semantic ranker as the reliability backstop\n"
-        "- Integrated `AzureOpenAIVectorizer` — no client-side embedding at query time"
-    )
-
-
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
 
 
 st.title("RAG after Build 2026")
+
+settings = get_settings()
+st.caption(
+    f"Live against Azure: index `{settings.search_index_name}` • "
+    f"embedding `{settings.aoai_embedding_deployment}` • "
+    f"chat `{settings.aoai_chat_deployment}`"
+)
 
 PUBLIC_DEMO = os.environ.get("PUBLIC_DEMO", "").lower() == "true"
 TAB3_LIMIT_PER_SESSION = 10
@@ -489,7 +664,7 @@ if PUBLIC_DEMO:
         f"each browser session can run **up to {TAB3_LIMIT_PER_SESSION} "
         f"agentic queries (Tab 3)** before Azure OpenAI calls are paused. "
         f"Refresh the page to reset, or [clone the repo]"
-        f"(https://github.com/) and run it against your own subscription "
+        f"(https://github.com/lizarragajorge/azure-rag-maturity-demo) and run it against your own subscription "
         f"to lift the cap."
     )
 
@@ -503,7 +678,7 @@ st.markdown(
     "that search step."
 )
 
-with st.expander("📖  RAG vocabulary cheat-sheet (open me before the demo)"):
+with st.expander("📖  RAG vocabulary cheat-sheet"):
     st.markdown(
         "- **Index** — the searchable copy of your documents, broken into "
         "small *chunks* (a paragraph or two each).\n"
