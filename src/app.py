@@ -1148,6 +1148,77 @@ with tab_semantic:
         "| `content-only` | Ignore the title and keywords — only the body matters. |\n"
         "| `title-and-keywords` | Title and keywords get the most weight; body is supporting. |"
     )
+
+    with st.expander("👩‍💻 Show me the code — verbatim from `src/build_index.py`"):
+        st.caption(
+            "All three configurations live on the **same index**, on the "
+            "**same fields**. Switching between them at query time is just a "
+            "different `semantic_configuration_name` string — no re-indexing, "
+            "no re-embedding, no extra storage. That's why this is the "
+            "cheapest relevance lever you have."
+        )
+        st.code(
+            'from azure.search.documents.indexes.models import (\n'
+            '    SemanticSearch, SemanticConfiguration,\n'
+            '    SemanticPrioritizedFields, SemanticField,\n'
+            ')\n'
+            '\n'
+            'semantic_search = SemanticSearch(\n'
+            '    default_configuration_name="default-balanced",\n'
+            '    configurations=[\n'
+            '        # 1) Balanced — the safest default\n'
+            '        SemanticConfiguration(\n'
+            '            name="default-balanced",\n'
+            '            prioritized_fields=SemanticPrioritizedFields(\n'
+            '                title_field=SemanticField(field_name="title"),\n'
+            '                content_fields=[SemanticField(field_name="content")],\n'
+            '                keywords_fields=[SemanticField(field_name="keywords")],\n'
+            '            ),\n'
+            '        ),\n'
+            '        # 2) Content-only — title/keywords are noise (boilerplate titles)\n'
+            '        SemanticConfiguration(\n'
+            '            name="content-only",\n'
+            '            prioritized_fields=SemanticPrioritizedFields(\n'
+            '                content_fields=[SemanticField(field_name="content")],\n'
+            '            ),\n'
+            '        ),\n'
+            '        # 3) Title + keywords first — body is supporting evidence\n'
+            '        SemanticConfiguration(\n'
+            '            name="title-and-keywords",\n'
+            '            prioritized_fields=SemanticPrioritizedFields(\n'
+            '                title_field=SemanticField(field_name="title"),\n'
+            '                keywords_fields=[SemanticField(field_name="keywords")],\n'
+            '                content_fields=[SemanticField(field_name="content")],\n'
+            '            ),\n'
+            '        ),\n'
+            '    ],\n'
+            ')\n'
+            '\n'
+            '# Attach to the index alongside fields + vector_search\n'
+            'index = SearchIndex(\n'
+            '    name=settings.search_index_name,\n'
+            '    fields=fields,\n'
+            '    vector_search=vector_search,\n'
+            '    semantic_search=semantic_search,\n'
+            ')\n'
+            '\n'
+            '# ──────────────────────────────────────────────────────────────\n'
+            '# At query time, just pick which one to use\n'
+            '# (src/retrieval_lab.py::run_semantic)\n'
+            'results = client.search(\n'
+            '    search_text=query,\n'
+            '    query_type="semantic",\n'
+            '    semantic_configuration_name="title-and-keywords",  # ← swap freely\n'
+            '    top=5,\n'
+            ')',
+            language="python",
+        )
+        st.markdown(
+            "👉 Full source: "
+            "[`src/build_index.py` lines 159–185](https://github.com/lizarragajorge/azure-rag-maturity-demo/blob/main/src/build_index.py#L159-L185)  "
+            "·  [`src/retrieval_lab.py::run_semantic`](https://github.com/lizarragajorge/azure-rag-maturity-demo/blob/main/src/retrieval_lab.py)"
+        )
+
     st.markdown(
         "**What to watch for:** pick a question whose answer is in a "
         "document's **title** (e.g. *'transformer oil sample interpretation'* "
