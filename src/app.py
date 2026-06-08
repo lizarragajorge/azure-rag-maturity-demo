@@ -205,11 +205,11 @@ flowchart LR
         ],
         "diagram": """
 flowchart LR
-    DOCS[(Documents)] -. chunked + embedded .-> SEARCH
+    DOCS[(Documents)] -. chunked .-> EMB
+    EMB[Azure OpenAI<br/>text-embedding-3-large] -. vectors .-> SEARCH
     U([User]) -- question --> APP[Your app]
-    APP -- vectorize query --> EMB[Azure OpenAI<br/>text-embedding-3-large]
-    EMB -- 3072-dim vector --> APP
-    APP -- vector query --> SEARCH[Azure AI Search<br/>vector index]
+    APP -- vector query<br/>VectorizableTextQuery --> SEARCH[Azure AI Search<br/>vector index]
+    SEARCH -- integrated vectorizer<br/>embeds query --> EMB
     SEARCH -- top-k chunks --> APP
     APP -- chunks + question --> AOAI[Azure OpenAI<br/>gpt-5-mini]
     AOAI -- answer --> APP --> U
