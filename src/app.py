@@ -525,21 +525,49 @@ def get_settings() -> Settings:
     return Settings.from_env()
 
 
-# Queries written to PARAPHRASE the corpus, not quote it. That's the point:
-# keyword loses when the user doesn't speak the document's vocabulary.
+# Each query is engineered to make ONE method shine and the others either
+# pull the wrong doc or rank the right doc lower. That divergence is the
+# entire point of Tab 1 — if all four methods agree, the demo is boring.
 SAMPLE_QUERIES_RELIABILITY = [
-    "what gear protects me from a really bad arc flash",
-    "how fast do we have to tell the feds about a cyber incident",
-    "when can we shut off heat to a homeowner during a cold snap",
-    "is it ok if the dispatcher tells customers power is coming back sooner",
-    "what do we do if the gas stops smelling like gas",
+    # Pure paraphrase: target doc 011 (mercaptan/odorization) but query uses
+    # ZERO of its tokens. Vector should win; BM25 will latch onto any doc that
+    # mentions "gas" or "leak".
+    "the stuff they add to natural gas so people can smell leaks",
+    # Exact regulation cite: target doc 012 (FAC-003). BM25 nails this on the
+    # first token. Vector will pull other transmission/right-of-way docs.
+    "FAC-003 minimum vegetation clearance for transmission",
+    # Hybrid sweet spot: rare numeric threshold ("25 cal/cm²") + paraphrased
+    # question ("what category"). BM25 catches the number, vector catches the
+    # intent, hybrid fuses both, reranker confirms.
+    "what category of PPE do I need at 25 cal per cm squared",
+    # Reranker disambiguates: "de-energize during fire season" is paraphrase
+    # for PSPS (doc 003), but "fire" also appears in 012 (veg mgmt). Vector
+    # may split; only the reranker reads the QUESTION and picks PSPS.
+    "when should we proactively de-energize lines during fire season",
+    # Ambiguity stress test: multiple docs share "customer" + "power" +
+    # "notify". BM25 fans out; vector splits; only the reranker picks the
+    # outage-communication template (doc 004).
+    "what do we have to tell residential customers when their power is out",
 ]
 
+# Each query targets a SPECIFIC semantic config:
+#   • a near-title match → `title-and-keywords` wins by a wide margin
+#   • a body-only detail (title is misleading) → `content-only` wins
+#   • a mixed query (title language + body intent) → `default-balanced` wins
 SAMPLE_QUERIES_SEMANTIC = [
-    "transformer oil sample interpretation",
-    "tree trimming clearance requirements",
-    "rooftop solar approval process",
-    "smart meter installation steps",
+    # → title-and-keywords (nearly the literal title of doc 002)
+    "pad-mount transformer preventive maintenance schedule",
+    # → title-and-keywords (nearly the literal title of doc 010)
+    "substation arc-flash PPE selection matrix",
+    # → content-only: DGA / dissolved gas analysis lives in BODY of doc 002,
+    #   but doc 002's title is just "PM Schedule" — useless for ranking
+    "what lab test tells us if a transformer has internal damage",
+    # → content-only: "sniff test failure" lives in BODY of doc 011, title is
+    #   "Mercaptan Injection Requirements" — actively misleading
+    "what do we do if the rotten-egg smell fades from the gas in the line",
+    # → default-balanced: "Itron" is in keywords, "swap-out" is body language,
+    #   title is "Field Procedure". Each config picks up a different signal.
+    "Itron meter swap-out gotchas in the field",
 ]
 
 SAMPLE_QUERIES_AGENTIC = [
@@ -634,6 +662,70 @@ def _result_card(result: RunResult, *, color: str, show_snippet: bool = True) ->
                 }
             )
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+def _render_rank_shift(
+    per_method: dict[str, RunResult],
+    *,
+    sort_priority: tuple[str, ...],
+) -> None:
+    """Render a per-doc rank table across methods, highlighting top ranks.
+
+    `per_method` maps method label → its `RunResult`. `sort_priority` is the
+    column order used to sort rows so the "best by the method we trust most"
+    floats to the top.
+    """
+    def _best_rank_per_doc(result: RunResult) -> dict[str, tuple[int, str]]:
+        ranks: dict[str, tuple[int, str]] = {}
+        for rank, h in enumerate(result.hits, 1):
+            if h.parent_id not in ranks:
+                ranks[h.parent_id] = (rank, h.title)
+        return ranks
+
+    per_lookup = {name: _best_rank_per_doc(r) for name, r in per_method.items()}
+    all_docs: dict[str, str] = {}
+    for ranks in per_lookup.values():
+        for pid, (_, title) in ranks.items():
+            all_docs[pid] = title
+
+    if not all_docs:
+        st.info("No results from any method.")
+        return
+
+    method_names = list(per_method.keys())
+    rows = []
+    for pid, title in all_docs.items():
+        row: dict[str, object] = {"Document": title}
+        for name in method_names:
+            ranks = per_lookup[name]
+            row[name] = ranks[pid][0] if pid in ranks else None
+        rows.append(row)
+
+    rank_df = pd.DataFrame(rows)
+    rank_df["_sort"] = rank_df[list(sort_priority)].min(axis=1, skipna=True)
+    rank_df = (
+        rank_df.sort_values("_sort", na_position="last")
+        .drop(columns="_sort")
+        .reset_index(drop=True)
+    )
+
+    def _highlight_rank(val):
+        if pd.isna(val):
+            return "color:#9ca3af"
+        if val == 1:
+            return "background-color:#dcfce7;color:#166534;font-weight:700"
+        if val == 2:
+            return "background-color:#fef3c7;color:#854d0e"
+        if val == 3:
+            return "background-color:#fef9c3;color:#854d0e"
+        return ""
+
+    styled = (
+        rank_df.style
+        .applymap(_highlight_rank, subset=method_names)
+        .format(na_rep="—", precision=0)
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -922,10 +1014,74 @@ with tab_reliability:
         else:
             st.info(
                 "All four modes converged on the same top document. The "
-                "differences will show up in the **score** — and that's what "
-                "matters for a 'should I trust this enough to feed an LLM' "
-                "decision."
+                "differences will show up in the **rank shift** and **score "
+                "scale** tables below — that's where the value of layering on "
+                "hybrid + reranker actually pays off."
             )
+
+        # -- Rank-shift table: same docs, different positions per method ----
+        st.markdown("### 📊  Rank shift — same docs, different positions")
+        st.markdown(
+            "Each row is a document that appeared in **at least one method's "
+            "top 5**. The number = the rank that method gave it. A blank cell "
+            "means the method didn't surface that doc at all. **Watch the "
+            "columns disagree** — that's the value of layering methods."
+        )
+        _render_rank_shift(
+            {
+                "BM25": keyword,
+                "Vector": vector,
+                "Hybrid": hybrid,
+                "Semantic": semantic,
+            },
+            sort_priority=("Semantic", "Hybrid", "Vector", "BM25"),
+        )
+
+        # -- Score-scale table: prove the reranker is the only gateable score
+        st.markdown("### 📈  Top-1 scores — different scales, only one is gateable")
+        st.caption(
+            "Each method emits a score on a **different scale**. You can rank "
+            "*within* a column but you can't compare *across* columns — except "
+            "the **semantic reranker (0–4)**, which is calibrated across "
+            "queries and indexes. That's the score your LLM-trust gate uses."
+        )
+        score_rows = [
+            {
+                "Method": "BM25 keyword",
+                "Top-1 score": round(float(keyword.hits[0].search_score or 0.0), 3) if keyword.hits else 0.0,
+                "Scale": "unbounded · per-query",
+                "Gateable across queries?": "No",
+            },
+            {
+                "Method": "Vector (cosine)",
+                "Top-1 score": round(float(vector.hits[0].search_score or 0.0), 3) if vector.hits else 0.0,
+                "Scale": "~0–1 · per-query",
+                "Gateable across queries?": "No",
+            },
+            {
+                "Method": "Hybrid (RRF fusion)",
+                "Top-1 score": round(float(hybrid.hits[0].search_score or 0.0), 3) if hybrid.hits else 0.0,
+                "Scale": "~0–1 · per-query",
+                "Gateable across queries?": "No",
+            },
+            {
+                "Method": "Semantic raw search",
+                "Top-1 score": round(float(semantic.hits[0].search_score or 0.0), 3) if semantic.hits else 0.0,
+                "Scale": "~0–1 · per-query",
+                "Gateable across queries?": "No",
+            },
+            {
+                "Method": "Semantic RERANKER",
+                "Top-1 score": round(float(semantic.hits[0].reranker_score or 0.0), 3) if semantic.hits else 0.0,
+                "Scale": "0–4 · stable across queries",
+                "Gateable across queries?": "Yes ✓",
+            },
+        ]
+        st.dataframe(
+            pd.DataFrame(score_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1016,10 +1172,31 @@ with tab_semantic:
             )
         else:
             st.info(
-                "All three configs picked the same top doc — but the scores "
-                "below show by how much. Pick a query where title vs. body "
-                "matters more to see them split."
+                "All three configs picked the same top doc — but the **rank "
+                "shift table** below shows how the *runner-up* docs moved. "
+                "That's where tuning the config buys you precision."
             )
+
+        # -- Rank-shift table for the three semantic configs ---------------
+        st.markdown("### 📊  Rank shift across configs — same data, different recipes")
+        st.markdown(
+            "Each row is a document that appeared in at least one config's "
+            "top 5. Watch how a title-heavy recipe pushes title-matching "
+            "docs up, while content-only pushes body-matching docs up. "
+            "All scores here are on the same 0–4 reranker scale."
+        )
+        _render_rank_shift(
+            {
+                "default-balanced": r_default,
+                "content-only": r_content,
+                "title-and-keywords": r_titlekw,
+            },
+            sort_priority=(
+                "default-balanced",
+                "content-only",
+                "title-and-keywords",
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
