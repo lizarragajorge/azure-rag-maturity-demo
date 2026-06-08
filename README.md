@@ -77,6 +77,21 @@ python src/agentic_demo.py --setup
 streamlit run src/app.py
 ```
 
+## Security posture
+
+This is a **public demo**, not a production template. See [SECURITY.md](SECURITY.md)
+for the full threat-by-threat write-up. The short version:
+
+- Keyless auth end-to-end (user-assigned managed identity + RBAC). `disableLocalAuth: true` on both Search and Azure OpenAI.
+- Streamlit XSRF protection stays on. Container runs as a non-root user.
+- Per-session cap of 10 agentic queries + `max_completion_tokens=600` on the LLM call bounds the cost of cost-DoS attempts.
+- User-controlled text is XML-delimited inside the LLM prompt to blunt direct prompt-injection.
+- Bicep param `ingressAllowedIpRanges` is an empty array by default (open). Pass a non-empty array of `ipSecurityRestrictions` objects to restrict to known IPs without changing code.
+
+## License
+
+[MIT](LICENSE) — fork it, modify it, deploy it.
+
 ## What to show in the meeting
 
 Follow [docs/demo-script.md](docs/demo-script.md). It walks through the two

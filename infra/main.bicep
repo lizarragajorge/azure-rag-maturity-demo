@@ -75,6 +75,9 @@ param webMinReplicas int = 1
 @minValue(1)
 param webMaxReplicas int = 3
 
+@description('Optional IP allow-list for the public Container App ingress. Empty array = open to the internet (default for the demo). Provide objects like { name: "office", ipAddressRange: "203.0.113.0/24", action: "Allow" } to restrict access.')
+param ingressAllowedIpRanges array = []
+
 @description('Tags applied to all resources (azd injects azd-env-name here).')
 param tags object = {}
 
@@ -343,6 +346,7 @@ resource webApp 'Microsoft.App/containerApps@2024-03-01' = {
         targetPort: 8000
         transport: 'auto'
         allowInsecure: false
+        ipSecurityRestrictions: empty(ingressAllowedIpRanges) ? null : ingressAllowedIpRanges
       }
       registries: [
         {
