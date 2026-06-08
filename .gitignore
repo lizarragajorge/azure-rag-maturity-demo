@@ -6,7 +6,7 @@ __pycache__/
 .azure/
 
 # Bicep compile output — generated from main.bicep, not source of truth
-infra/*.json
+infra/main.json
 
 # Internal/private docs — not for the public repo
 docs/
