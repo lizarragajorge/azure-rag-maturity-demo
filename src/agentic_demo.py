@@ -31,7 +31,8 @@ from openai import AzureOpenAI
 
 from common import Settings, get_aoai_token_provider, get_credential
 
-API_VERSION = "2026-04-01"
+API_VERSION = "2026-04-01"               # GA — used for KB / KS lifecycle
+RETRIEVE_API_VERSION = "2026-05-01-preview"  # preview — enables modelQueryPlanning
 SEARCH_SCOPE = "https://search.azure.com/.default"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
@@ -150,30 +151,43 @@ def retrieve(
     settings: Settings,
     question: str,
     conversation: Optional[list[dict]] = None,
-    reasoning_effort: str = "low",  # kept for CLI compat; not used in GA body
+    reasoning_effort: str = "low",
 ) -> dict[str, Any]:
     """Send a user query to the knowledge base and return the raw response.
 
-    The GA 2026-04-01 retrieve body takes `intents` (one or more semantic
-    queries) and `knowledgeSourceParams` (per-source runtime options).  We
-    pass the user's question as a single semantic intent, ask for activity
-    and references, and let the KB do its agentic decomposition + ranking.
+    Uses the **preview** 2026-05-01-preview API with the `messages` shape so the
+    KB runs **modelQueryPlanning** — the chat model registered on the KB
+    decomposes the question into sub-queries, runs them in parallel against
+    the knowledge source, reranks, and returns activity + references.
 
-    Response shape:
-      - `response`   : the synthesized answer (text content)
-      - `activity`   : the planning + subquery trace
+    We deliberately keep `outputMode = extractiveData` so the KB just returns
+    grounding; our own `synthesize_answer()` then calls the chat model with a
+    prompt-injection-hardened system message to produce the final cited prose.
+
+    Response shape (preview):
+      - `response`   : grounding text payload
+      - `activity`   : ordered trace; expect modelQueryPlanning, multiple
+                       searchIndex (one per sub-query), agenticReasoning
       - `references` : grounded chunks with rerankerScore and docKey
     """
-    del conversation, reasoning_effort  # accepted for forward-compat
+    del conversation  # accepted for forward-compat
     credential = get_credential()
     url = (
         f"{settings.search_endpoint}/knowledgebases/{settings.knowledge_base_name}"
-        f"/retrieve?api-version={API_VERSION}"
+        f"/retrieve?api-version={RETRIEVE_API_VERSION}"
     )
 
     body = {
-        "intents": [{"search": question, "type": "semantic"}],
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": question}],
+            }
+        ],
         "includeActivity": True,
+        "outputMode": "extractiveData",
+        "retrievalReasoningEffort": {"kind": reasoning_effort},
+        "maxRuntimeInSeconds": 60,
         "knowledgeSourceParams": [
             {
                 "knowledgeSourceName": settings.knowledge_source_name,

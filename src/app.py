@@ -397,24 +397,32 @@ flowchart LR
             "caption": (
                 "Verbatim from `src/agentic_demo.py::retrieve` — this is what "
                 "Tab 3 calls. **One REST call** to `POST /knowledgebases/{name}/retrieve` "
-                "on api-version `2026-04-01` (GA). The KB does the query "
-                "decomposition, runs the subqueries in parallel against the "
-                "knowledge source, and returns grounding + activity trace."
+                "on api-version `2026-05-01-preview`. Sending `messages` "
+                "(instead of `intents`) flips the KB into **modelQueryPlanning** "
+                "mode: the chat model registered on the KB decomposes the "
+                "question, runs the sub-queries in parallel, and returns the "
+                "full activity trace (planner → N × searchIndex → reasoning)."
             ),
             "file": "src/agentic_demo.py",
             "language": "python",
             "body": (
-                'API_VERSION = "2026-04-01"  # GA — Build 2026 release\n'
+                'RETRIEVE_API_VERSION = "2026-05-01-preview"  # enables LLM planning\n'
                 '\n'
-                'def retrieve(settings, question):\n'
+                'def retrieve(settings, question, reasoning_effort="low"):\n'
                 '    url = (\n'
                 '        f"{settings.search_endpoint}"\n'
                 '        f"/knowledgebases/{settings.knowledge_base_name}"\n'
-                '        f"/retrieve?api-version={API_VERSION}"\n'
+                '        f"/retrieve?api-version={RETRIEVE_API_VERSION}"\n'
                 '    )\n'
                 '    body = {\n'
-                '        "intents": [{"search": question, "type": "semantic"}],\n'
+                '        "messages": [{                  # ← messages, not intents,\n'
+                '            "role": "user",            #   triggers the planner\n'
+                '            "content": [{"type": "text", "text": question}],\n'
+                '        }],\n'
                 '        "includeActivity": True,\n'
+                '        "outputMode": "extractiveData",     # we synthesize ourselves\n'
+                '        "retrievalReasoningEffort": {"kind": reasoning_effort},\n'
+                '        "maxRuntimeInSeconds": 60,\n'
                 '        "knowledgeSourceParams": [{\n'
                 '            "knowledgeSourceName": settings.knowledge_source_name,\n'
                 '            "kind": "searchIndex",\n'
@@ -425,7 +433,8 @@ flowchart LR
                 '    r = requests.post(url, headers=_headers(...),\n'
                 '                      data=json.dumps(body), timeout=120)\n'
                 '    r.raise_for_status()\n'
-                '    return r.json()   # → {"response":..., "activity":..., "references":[...]}'
+                '    return r.json()\n'
+                '# activity → [modelQueryPlanning, searchIndex × N, agenticReasoning]'
             ),
         },
     },
@@ -571,19 +580,42 @@ SAMPLE_QUERIES_SEMANTIC = [
 ]
 
 SAMPLE_QUERIES_AGENTIC = [
+    # Spans docs 003 (PSPS), 004 (outage templates). Planner should split into
+    # "planned PSPS notification", "unplanned storm outage notification",
+    # "ETR-update timing requirements".
     (
-        "If a Grade 1 gas leak is detected next to a substation that is also "
-        "experiencing a CIP-008 reportable cyber incident, what are our "
-        "concurrent notification obligations and field actions in the first hour?"
+        "What's the difference between how we notify residential customers "
+        "about a planned PSPS de-energization versus an unplanned storm "
+        "outage, and which one has stricter ETR-update requirements?"
     ),
+    # Spans docs 001 (gas leak Grade 1), 014 (CIP-008 cyber response). Two
+    # different incident types in the same scenario — must be decomposed.
     (
-        "Compare what we tell a residential customer about a planned PSPS "
-        "de-energization vs. an unplanned storm outage — same template or "
-        "different?"
+        "Compare the first-hour notification obligations for a Grade 1 gas "
+        "leak versus a CIP-008 cyber incident at a substation — who do we "
+        "call, in what order, and how long do we have for each?"
     ),
+    # Spans docs 008 (AMI install procedure), 009 (billing dispute SOP).
+    # "What was logged during the install" vs "what the dispute SOP requires".
     (
-        "A customer disputes a bill that covers a period including their AMI "
-        "meter install. What waivers apply and what evidence do we keep?"
+        "A residential customer says their bill spiked right after their AMI "
+        "meter was installed. What field-procedure steps should have been "
+        "logged during the install, and what does our billing-dispute SOP "
+        "require us to do?"
+    ),
+    # Spans docs 013 (cold-weather load shed), 004 (outage comms). Three
+    # natural sub-questions joined by "how does that interact" and "what's the".
+    (
+        "Cold snap forecast: what triggers firm-gas curtailment, how does "
+        "that interact with rolling-blackout load shedding, and what's the "
+        "customer communication template we'd use?"
+    ),
+    # Spans docs 016 (small-gen interconnection / IEEE 1547), 007 (rate case
+    # tariff). Engineering rules + tariff/legal evidence — different domains.
+    (
+        "Before approving a residential rooftop solar interconnection, what "
+        "IEEE 1547 / Rule 21 requirements apply, AND what evidence does the "
+        "2026 rate-case tariff require us to keep for net-metering disputes?"
     ),
 ]
 
