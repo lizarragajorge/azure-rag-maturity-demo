@@ -722,7 +722,7 @@ def _render_rank_shift(
 
     styled = (
         rank_df.style
-        .applymap(_highlight_rank, subset=method_names)
+        .map(_highlight_rank, subset=method_names)
         .format(na_rep="—", precision=0)
     )
     st.dataframe(styled, use_container_width=True, hide_index=True)
